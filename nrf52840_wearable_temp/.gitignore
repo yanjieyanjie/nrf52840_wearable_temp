@@ -1,0 +1,19 @@
+# NCS Zephyr 编译输出
+build/
+build_clean/
+twister-out/
+zephyr/.config
+zephyr/CMakeCache.txt
+
+# VSCode本地配置
+.vscode/
+
+# 系统垃圾文件
+.DS_Store
+Thumbs.db
+
+# 编译产物
+*.elf
+*.hex
+*.bin
+*.log
