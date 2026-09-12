@@ -4,4 +4,10 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(nrf52840_wearable_temp)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+    src/main.c
+    src/sensor_manager.c
+    src/display_manager.c
+    src/ble_service.c
+    src/config_manager.c
+)

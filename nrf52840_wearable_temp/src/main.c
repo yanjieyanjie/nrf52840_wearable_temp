@@ -1,529 +1,629 @@
 #include <zephyr/kernel.h>
-#include <zephyr/device.h>
 
-#include <zephyr/drivers/sensor.h>
-#include <zephyr/drivers/display.h>
-#include <zephyr/display/cfb.h>
+#include "sensor_manager.h"
+#include "display_manager.h"
+#include "ble_service.h"
+#include "config_manager.h"
 
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/gatt.h>
-
-#include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/util.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 
 /* =========================================================
- * BLE UUID
- * =========================================================
- *
- * Service:
- * 8e400001-f315-4f60-9fb8-838830daea50
- *
- * Temperature:
- * 8e400002-f315-4f60-9fb8-838830daea50
- *
- * Sampling Interval:
- * 8e400003-f315-4f60-9fb8-838830daea50
- */
-
-#define BT_UUID_WEARABLE_SERVICE_VAL \
-    BT_UUID_128_ENCODE(0x8e400001, 0xf315, 0x4f60, 0x9fb8, 0x838830daea50)
-
-#define BT_UUID_WEARABLE_TEMP_VAL \
-    BT_UUID_128_ENCODE(0x8e400002, 0xf315, 0x4f60, 0x9fb8, 0x838830daea50)
-
-#define BT_UUID_WEARABLE_INTERVAL_VAL \
-    BT_UUID_128_ENCODE(0x8e400003, 0xf315, 0x4f60, 0x9fb8, 0x838830daea50)
-
-
-static struct bt_uuid_128 wearable_service_uuid =
-    BT_UUID_INIT_128(BT_UUID_WEARABLE_SERVICE_VAL);
-
-static struct bt_uuid_128 wearable_temp_uuid =
-    BT_UUID_INIT_128(BT_UUID_WEARABLE_TEMP_VAL);
-
-static struct bt_uuid_128 wearable_interval_uuid =
-    BT_UUID_INIT_128(BT_UUID_WEARABLE_INTERVAL_VAL);
-
-
-/* =========================================================
- * 系统状态
+ * Reliability Configuration
  * =========================================================
  */
 
 /*
- * 当前温度
- *
- * 单位：0.1°C
- *
- * 例如：
- * 278 = 27.8°C
+ * 一次采样失败后，
+ * 最多尝试 3 次。
  */
-static volatile int16_t current_temp_tenths = 0;
+#define SENSOR_MAX_RETRIES       3
 
 
 /*
- * BLE 是否已经连接
+ * 每次重试之间等待 100 ms。
  */
-static volatile bool ble_connected = false;
+#define SENSOR_RETRY_DELAY_MS    100
+
+
+/* =========================================================
+ * Sensor Message
+ * =========================================================
+ *
+ * Sensor Thread
+ *      ↓
+ * sensor_msgq
+ *      ↓
+ * Main / Application Thread
+ * =========================================================
+ */
+
+struct sensor_message
+{
+    /*
+     * 温度
+     *
+     * 单位：
+     * 0.1°C
+     *
+     * 例如：
+     *
+     * 286 = 28.6°C
+     */
+    int16_t temperature;
+
+
+    /*
+     * 采样时间戳
+     *
+     * 单位：
+     * ms
+     *
+     * 从系统启动开始计算。
+     */
+    uint32_t timestamp_ms;
+
+
+    /*
+     * 当前传感器状态。
+     */
+    bool sensor_ok;
+
+
+    /*
+     * 最后一次传感器错误码。
+     *
+     * 正常：
+     * 0
+     *
+     * 异常示例：
+     * -5
+     */
+    int error_code;
+};
+
+
+/* =========================================================
+ * Display Message
+ * =========================================================
+ *
+ * Main / Application Thread
+ *      ↓
+ * display_msgq
+ *      ↓
+ * Display Thread
+ * =========================================================
+ */
+
+struct display_message
+{
+    int16_t temperature;
+
+    bool ble_connected;
+
+    bool sensor_ok;
+
+    int sensor_error;
+};
+
+
+/* =========================================================
+ * Message Queues
+ * =========================================================
+ */
 
 
 /*
- * 手机是否打开 Temperature Notification
+ * Sensor Thread
+ *      ↓
+ * Main Thread
+ *
+ * 最多缓存 4 条 Sensor Message。
  */
-static volatile bool notify_enabled = false;
+K_MSGQ_DEFINE(
+    sensor_msgq,
+    sizeof(struct sensor_message),
+    4,
+    4
+);
 
 
 /*
- * 温度采样周期
+ * Main Thread
+ *      ↓
+ * Display Thread
  *
- * 单位：ms
- *
- * 默认：
- * 2000 ms = 2 秒
+ * 最多缓存 4 条 Display Message。
  */
-static volatile uint16_t sampling_interval_ms = 2000;
-
-
-/* =========================================================
- * Temperature READ
- * =========================================================
- */
-
-static ssize_t read_temperature(
-    struct bt_conn *conn,
-    const struct bt_gatt_attr *attr,
-    void *buf,
-    uint16_t len,
-    uint16_t offset)
-{
-    /*
-     * BLE 中发送 uint16/int16
-     * 使用 Little Endian
-     */
-    int16_t value =
-        sys_cpu_to_le16(current_temp_tenths);
-
-
-    printk(
-        "GATT READ temperature: %d.%d C\n",
-        current_temp_tenths / 10,
-        abs(current_temp_tenths % 10)
-    );
-
-
-    return bt_gatt_attr_read(
-        conn,
-        attr,
-        buf,
-        len,
-        offset,
-        &value,
-        sizeof(value)
-    );
-}
-
-
-/* =========================================================
- * Notification CCCD
- * =========================================================
- */
-
-static void temp_ccc_cfg_changed(
-    const struct bt_gatt_attr *attr,
-    uint16_t value)
-{
-    notify_enabled =
-        (value == BT_GATT_CCC_NOTIFY);
-
-
-    if (notify_enabled) {
-
-        printk(
-            "Temperature notification ENABLED\n"
-        );
-
-    } else {
-
-        printk(
-            "Temperature notification DISABLED\n"
-        );
-    }
-}
-
-
-/* =========================================================
- * Sampling Interval READ
- * =========================================================
- */
-
-static ssize_t read_sampling_interval(
-    struct bt_conn *conn,
-    const struct bt_gatt_attr *attr,
-    void *buf,
-    uint16_t len,
-    uint16_t offset)
-{
-    uint16_t value =
-        sys_cpu_to_le16(sampling_interval_ms);
-
-
-    printk(
-        "GATT READ interval: %u ms\n",
-        sampling_interval_ms
-    );
-
-
-    return bt_gatt_attr_read(
-        conn,
-        attr,
-        buf,
-        len,
-        offset,
-        &value,
-        sizeof(value)
-    );
-}
-
-
-/* =========================================================
- * Sampling Interval WRITE
- * =========================================================
- */
-
-static ssize_t write_sampling_interval(
-    struct bt_conn *conn,
-    const struct bt_gatt_attr *attr,
-    const void *buf,
-    uint16_t len,
-    uint16_t offset,
-    uint8_t flags)
-{
-    /*
-     * 不允许 offset write
-     */
-    if (offset != 0) {
-
-        return BT_GATT_ERR(
-            BT_ATT_ERR_INVALID_OFFSET
-        );
-    }
-
-
-    /*
-     * Sampling Interval
-     * 使用 uint16_t
-     *
-     * 所以必须收到 2 Bytes
-     */
-    if (len != sizeof(uint16_t)) {
-
-        return BT_GATT_ERR(
-            BT_ATT_ERR_INVALID_ATTRIBUTE_LEN
-        );
-    }
-
-
-    /*
-     * BLE：
-     * Little Endian → CPU uint16_t
-     */
-    uint16_t new_interval =
-        sys_get_le16(buf);
-
-
-    /*
-     * 合法范围：
-     *
-     * 最短：1000 ms
-     * 最长：10000 ms
-     */
-    if (new_interval < 1000 ||
-        new_interval > 10000) {
-
-        printk(
-            "Invalid interval: %u ms\n",
-            new_interval
-        );
-
-        return BT_GATT_ERR(
-            BT_ATT_ERR_VALUE_NOT_ALLOWED
-        );
-    }
-
-
-    /*
-     * 更新采样周期
-     */
-    sampling_interval_ms =
-        new_interval;
-
-
-    printk(
-        "Sampling interval changed to %u ms\n",
-        sampling_interval_ms
-    );
-
-
-    return len;
-}
-
-
-/* =========================================================
- * 自定义 GATT Service
- * =========================================================
- */
-
-BT_GATT_SERVICE_DEFINE(
-    wearable_service,
-
-    /*
-     * Attribute 0
-     *
-     * Primary Service
-     */
-    BT_GATT_PRIMARY_SERVICE(
-        &wearable_service_uuid
-    ),
-
-
-    /*
-     * Attribute 1：
-     * Temperature Characteristic Declaration
-     *
-     * Attribute 2：
-     * Temperature Value
-     */
-    BT_GATT_CHARACTERISTIC(
-        &wearable_temp_uuid.uuid,
-
-        BT_GATT_CHRC_READ |
-        BT_GATT_CHRC_NOTIFY,
-
-        BT_GATT_PERM_READ,
-
-        read_temperature,
-
-        NULL,
-
-        NULL
-    ),
-
-
-    /*
-     * Attribute 3
-     *
-     * CCCD
-     *
-     * 手机通过它打开/关闭 Notification
-     */
-    BT_GATT_CCC(
-        temp_ccc_cfg_changed,
-
-        BT_GATT_PERM_READ |
-        BT_GATT_PERM_WRITE
-    ),
-
-
-    /*
-     * Attribute 4：
-     * Sampling Interval Characteristic Declaration
-     *
-     * Attribute 5：
-     * Sampling Interval Value
-     */
-    BT_GATT_CHARACTERISTIC(
-        &wearable_interval_uuid.uuid,
-
-        BT_GATT_CHRC_READ |
-        BT_GATT_CHRC_WRITE,
-
-        BT_GATT_PERM_READ |
-        BT_GATT_PERM_WRITE,
-
-        read_sampling_interval,
-
-        write_sampling_interval,
-
-        NULL
-    )
+K_MSGQ_DEFINE(
+    display_msgq,
+    sizeof(struct display_message),
+    4,
+    4
 );
 
 
 /* =========================================================
- * Advertising Data
+ * Thread Configuration
  * =========================================================
  */
-
-/*
- * Advertising Packet：
- *
- * Flags
- * +
- * 128-bit Service UUID
- */
-static const struct bt_data ad[] = {
-
-    BT_DATA_BYTES(
-        BT_DATA_FLAGS,
-
-        BT_LE_AD_GENERAL |
-        BT_LE_AD_NO_BREDR
-    ),
-
-
-    BT_DATA_BYTES(
-        BT_DATA_UUID128_ALL,
-
-        BT_UUID_WEARABLE_SERVICE_VAL
-    ),
-};
 
 
 /*
- * Scan Response：
+ * Sensor Thread
+ */
+#define SENSOR_THREAD_STACK_SIZE 1536
+#define SENSOR_THREAD_PRIORITY   5
+
+
+/*
+ * Display Thread
  *
- * Complete Local Name
+ * Zephyr 中：
  *
- * WearableTemp
+ * 数字越小，
+ * 优先级越高。
+ *
+ * 所以 Sensor Thread 5
+ * 优先级高于 Display Thread 7。
  */
-static const struct bt_data sd[] = {
-
-    BT_DATA(
-        BT_DATA_NAME_COMPLETE,
-
-        CONFIG_BT_DEVICE_NAME,
-
-        sizeof(CONFIG_BT_DEVICE_NAME) - 1
-    ),
-};
+#define DISPLAY_THREAD_STACK_SIZE 1536
+#define DISPLAY_THREAD_PRIORITY   7
 
 
 /* =========================================================
- * 启动 BLE Advertising
+ * Thread Stack
  * =========================================================
  */
 
-static int start_advertising(void)
-{
-    int ret;
+
+K_THREAD_STACK_DEFINE(
+    sensor_thread_stack,
+    SENSOR_THREAD_STACK_SIZE
+);
 
 
-    ret = bt_le_adv_start(
-        BT_LE_ADV_CONN_FAST_1,
-
-        ad,
-        ARRAY_SIZE(ad),
-
-        sd,
-        ARRAY_SIZE(sd)
-    );
-
-
-    if (ret != 0) {
-
-        printk(
-            "Advertising failed: %d\n",
-            ret
-        );
-
-        return ret;
-    }
-
-
-    printk(
-        "Advertising started: %s\n",
-        CONFIG_BT_DEVICE_NAME
-    );
-
-
-    return 0;
-}
+K_THREAD_STACK_DEFINE(
+    display_thread_stack,
+    DISPLAY_THREAD_STACK_SIZE
+);
 
 
 /* =========================================================
- * BLE Connected Callback
+ * Thread Control Blocks
  * =========================================================
  */
 
-static void connected(
-    struct bt_conn *conn,
-    uint8_t err)
-{
-    if (err != 0) {
 
-        printk(
-            "BLE connection failed: %u\n",
-            err
-        );
+static struct k_thread sensor_thread_data;
 
-        return;
-    }
-
-
-    ble_connected = true;
-
-
-    printk(
-        "BLE CONNECTED\n"
-    );
-}
+static struct k_thread display_thread_data;
 
 
 /* =========================================================
- * BLE Disconnected Callback
+ * Sensor Thread
+ * =========================================================
+ *
+ * 职责：
+ *
+ * 1. 读取 DS18B20
+ * 2. 读取失败自动重试
+ * 3. 判断 Sensor Fault
+ * 4. 判断 Sensor Recovery
+ * 5. 把结果发送给 Main Thread
+ * 6. 根据当前配置进入 sleep
+ *
+ * Sensor Thread 不直接操作：
+ *
+ * OLED
+ * BLE Notification
  * =========================================================
  */
 
-static void disconnected(
-    struct bt_conn *conn,
-    uint8_t reason)
+
+static void sensor_thread_entry(
+    void *p1,
+    void *p2,
+    void *p3)
 {
-    ble_connected = false;
-
-    notify_enabled = false;
-
-
-    printk(
-        "BLE DISCONNECTED, reason: 0x%02X\n",
-        reason
-    );
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
 
 
     /*
-     * BLE 断开之后
-     * 自动重新开始广播
+     * 初始化为 0，
+     * 防止第一次读取就失败时 temperature
+     * 中存在未初始化数据。
      */
-    int ret = start_advertising();
+    struct sensor_message msg = {0};
 
 
-    if (ret != 0) {
+    /*
+     * 连续失败周期计数。
+     */
+    uint32_t consecutive_failures = 0;
+
+
+    /*
+     * 用于判断：
+     *
+     * FAULT
+     *   ↓
+     * RECOVERED
+     */
+    bool sensor_was_faulted = false;
+
+
+    int ret;
+
+
+    printk(
+        "SENSOR_THREAD: started\n"
+    );
+
+
+    while (1) {
+
+        bool read_success = false;
+
+        int last_error = 0;
+
+
+        /* =================================================
+         * 1. Sensor Read + Retry
+         * =================================================
+         */
+
+
+        for (
+            int attempt = 1;
+            attempt <= SENSOR_MAX_RETRIES;
+            attempt++
+        ) {
+
+            ret =
+                sensor_manager_read_temperature(
+                    &msg.temperature
+                );
+
+
+            /*
+             * 读取成功。
+             */
+            if (ret == 0) {
+
+                read_success = true;
+
+                break;
+            }
+
+
+            /*
+             * 保存最后一个错误码。
+             */
+            last_error = ret;
+
+
+            printk(
+                "SENSOR_THREAD: "
+                "read failed attempt %d/%d, err=%d\n",
+
+                attempt,
+                SENSOR_MAX_RETRIES,
+                ret
+            );
+
+
+            /*
+             * 如果还有下一次重试，
+             * 等待 100 ms。
+             */
+            if (
+                attempt <
+                SENSOR_MAX_RETRIES
+            ) {
+
+                k_sleep(
+                    K_MSEC(
+                        SENSOR_RETRY_DELAY_MS
+                    )
+                );
+            }
+        }
+
+
+        /* =================================================
+         * 2. Sensor 正常
+         * =================================================
+         */
+
+
+        if (read_success) {
+
+            msg.sensor_ok = true;
+
+            msg.error_code = 0;
+
+
+            msg.timestamp_ms =
+                k_uptime_get_32();
+
+
+            /*
+             * 如果上一周期处于 Fault，
+             * 现在读取成功，
+             * 就认为 Sensor 已恢复。
+             */
+            if (sensor_was_faulted) {
+
+                printk(
+                    "SENSOR_THREAD: "
+                    "SENSOR RECOVERED "
+                    "after %u failed cycles\n",
+
+                    consecutive_failures
+                );
+
+
+                sensor_was_faulted = false;
+            }
+
+
+            /*
+             * 恢复以后清零连续失败计数。
+             */
+            consecutive_failures = 0;
+
+
+            printk(
+                "SENSOR_THREAD: "
+                "temp=%d timestamp=%u\n",
+
+                msg.temperature,
+                msg.timestamp_ms
+            );
+
+        } else {
+
+            /* =============================================
+             * 3. Sensor Fault
+             * =============================================
+             *
+             * 连续 3 次读取都失败。
+             */
+
+
+            consecutive_failures++;
+
+
+            sensor_was_faulted = true;
+
+
+            msg.sensor_ok = false;
+
+            msg.error_code =
+                last_error;
+
+
+            msg.timestamp_ms =
+                k_uptime_get_32();
+
+
+            printk(
+                "SENSOR_THREAD: "
+                "SENSOR FAULT "
+                "cycle=%u error=%d\n",
+
+                consecutive_failures,
+                last_error
+            );
+        }
+
+
+        /* =================================================
+         * 4. Send Sensor Message
+         * =================================================
+         */
+
+
+        ret =
+            k_msgq_put(
+                &sensor_msgq,
+                &msg,
+                K_NO_WAIT
+            );
+
+
+        if (ret != 0) {
+
+            /*
+             * Main Thread 消费速度过慢，
+             * Queue 已满。
+             *
+             * Sensor Thread 不阻塞。
+             */
+            printk(
+                "SENSOR_THREAD: "
+                "sensor queue full, "
+                "message dropped\n"
+            );
+        }
+
+
+        /* =================================================
+         * 5. 获取当前 Sampling Interval
+         * =================================================
+         *
+         * 现在不再从 ble_service 获取。
+         *
+         * Sampling Interval 属于：
+         *
+         * config_manager
+         *
+         * 它可能来自：
+         *
+         * 默认值
+         * 或
+         * Flash 中恢复的值
+         * 或
+         * 手机 BLE WRITE 的新值
+         */
+
+
+        uint16_t interval =
+            config_manager_get_sampling_interval_ms();
+
 
         printk(
-            "Restart advertising failed: %d\n",
-            ret
+            "SENSOR_THREAD: "
+            "next cycle in %u ms\n",
+
+            interval
+        );
+
+
+        /* =================================================
+         * 6. Sleep
+         * =================================================
+         */
+
+
+        k_sleep(
+            K_MSEC(interval)
         );
     }
 }
 
 
-/*
- * 注册 BLE Connection Callback
+/* =========================================================
+ * Display Thread
+ * =========================================================
+ *
+ * Display Thread 唯一职责：
+ *
+ * OLED 更新。
+ *
+ * 没有消息时：
+ *
+ * BLOCKED
+ *
+ * 不轮询。
+ * =========================================================
  */
-BT_CONN_CB_DEFINE(conn_callbacks) = {
 
-    .connected =
-        connected,
 
-    .disconnected =
-        disconnected,
-};
+static void display_thread_entry(
+    void *p1,
+    void *p2,
+    void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+
+
+    struct display_message msg;
+
+
+    int ret;
+
+
+    printk(
+        "DISPLAY_THREAD: started\n"
+    );
+
+
+    while (1) {
+
+        /* =================================================
+         * 1. 等待 Display Message
+         * =================================================
+         */
+
+
+        ret =
+            k_msgq_get(
+                &display_msgq,
+                &msg,
+                K_FOREVER
+            );
+
+
+        if (ret != 0) {
+
+            printk(
+                "DISPLAY_THREAD: "
+                "queue receive failed: %d\n",
+
+                ret
+            );
+
+
+            continue;
+        }
+
+
+        /* =================================================
+         * 2. OLED Update
+         * =================================================
+         */
+
+
+        ret =
+            display_manager_update(
+                msg.temperature,
+                msg.ble_connected,
+                msg.sensor_ok,
+                msg.sensor_error
+            );
+
+
+        if (ret != 0) {
+
+            printk(
+                "DISPLAY_THREAD: "
+                "update failed: %d\n",
+
+                ret
+            );
+
+
+            continue;
+        }
+
+
+        /* =================================================
+         * 3. Debug Log
+         * =================================================
+         */
+
+
+        if (msg.sensor_ok) {
+
+            printk(
+                "DISPLAY_THREAD: "
+                "temp=%d BLE=%s\n",
+
+                msg.temperature,
+
+                msg.ble_connected
+                    ? "CONNECTED"
+                    : "ADV"
+            );
+
+        } else {
+
+            printk(
+                "DISPLAY_THREAD: "
+                "SENSOR ERROR=%d\n",
+
+                msg.sensor_error
+            );
+        }
+    }
+}
 
 
 /* =========================================================
@@ -531,31 +631,15 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
  * =========================================================
  */
 
+
 int main(void)
 {
-    /*
-     * 获取 DS18B20
-     */
-    const struct device *sensor =
-        DEVICE_DT_GET_ANY(maxim_ds18b20);
-
-
-    /*
-     * 获取 OLED
-     */
-    const struct device *display =
-        DEVICE_DT_GET(
-            DT_CHOSEN(zephyr_display)
-        );
-
-
-    struct sensor_value temp;
-
-
-    char temp_text[32];
-
-
     int ret;
+
+
+    struct sensor_message sensor_msg;
+
+    struct display_message display_msg;
 
 
     printk("\n");
@@ -569,480 +653,409 @@ int main(void)
     );
 
     printk(
+        " Reliable RTOS + NVS Version\n"
+    );
+
+    printk(
         "================================\n"
     );
 
 
     /* =====================================================
-     * DS18B20 初始化
+     * 1. Sensor Manager Init
      * =====================================================
      */
 
-    if (sensor == NULL) {
 
-        printk(
-            "ERROR: DS18B20 not found\n"
-        );
-
-        return 0;
-    }
-
-
-    if (!device_is_ready(sensor)) {
-
-        printk(
-            "ERROR: DS18B20 not ready\n"
-        );
-
-        return 0;
-    }
-
-
-    printk(
-        "DS18B20 READY\n"
-    );
-
-
-    /* =====================================================
-     * OLED 初始化
-     * =====================================================
-     */
-
-    if (!device_is_ready(display)) {
-
-        printk(
-            "ERROR: OLED not ready\n"
-        );
-
-        return 0;
-    }
-
-
-    printk(
-        "OLED READY\n"
-    );
-
-
-    /*
-     * 设置 OLED pixel format
-     */
-    ret = display_set_pixel_format(
-        display,
-        PIXEL_FORMAT_MONO10
-    );
-
-
-    if (ret != 0) {
-
-        /*
-         * 如果 MONO10 不支持
-         * 尝试 MONO01
-         */
-        ret = display_set_pixel_format(
-            display,
-            PIXEL_FORMAT_MONO01
-        );
-
-
-        if (ret != 0) {
-
-            printk(
-                "ERROR: pixel format failed\n"
-            );
-
-            return 0;
-        }
-    }
-
-
-    /*
-     * 初始化 Character Framebuffer
-     */
-    ret = cfb_framebuffer_init(
-        display
-    );
+    ret =
+        sensor_manager_init();
 
 
     if (ret != 0) {
 
         printk(
-            "ERROR: CFB init failed: %d\n",
+            "APP: sensor init failed: %d\n",
             ret
         );
 
-        return 0;
-    }
-
-
-    printk(
-        "CFB READY\n"
-    );
-
-
-    /*
-     * 使用 Zephyr 内置第 0 个字体
-     */
-    ret = cfb_framebuffer_set_font(
-        display,
-        0
-    );
-
-
-    if (ret != 0) {
-
-        printk(
-            "Set font failed: %d\n",
-            ret
-        );
-    }
-
-
-    /*
-     * 清屏
-     */
-    cfb_framebuffer_clear(
-        display,
-        true
-    );
-
-
-    /*
-     * 打开 OLED
-     */
-    ret = display_blanking_off(
-        display
-    );
-
-
-    if (ret != 0) {
-
-        printk(
-            "display_blanking_off failed: %d\n",
-            ret
-        );
-    }
-
-
-    /* =====================================================
-     * Bluetooth 初始化
-     * =====================================================
-     */
-
-    ret = bt_enable(NULL);
-
-
-    if (ret != 0) {
-
-        printk(
-            "ERROR: Bluetooth init failed: %d\n",
-            ret
-        );
-
-        return 0;
-    }
-
-
-    printk(
-        "Bluetooth READY\n"
-    );
-
-
-    /* =====================================================
-     * BLE Advertising
-     * =====================================================
-     */
-
-    ret = start_advertising();
-
-
-    if (ret != 0) {
 
         return 0;
     }
 
 
     /* =====================================================
-     * 主循环
+     * 2. Display Manager Init
      * =====================================================
      */
+
+
+    ret =
+        display_manager_init();
+
+
+    if (ret != 0) {
+
+        printk(
+            "APP: display init failed: %d\n",
+            ret
+        );
+
+
+        return 0;
+    }
+
+
+    /* =====================================================
+     * 3. Config Manager Init
+     * =====================================================
+     *
+     * 这里非常关键。
+     *
+     * Config Manager 会：
+     *
+     * 1. 初始化 Settings
+     * 2. 初始化 NVS Backend
+     * 3. 尝试从 Flash 恢复 Sampling Interval
+     *
+     * 如果 Flash 没有保存数据：
+     *
+     * 默认 = 2000 ms
+     */
+
+
+    ret =
+        config_manager_init();
+
+
+    if (ret != 0) {
+
+        printk(
+            "APP: config manager init failed: %d\n",
+            ret
+        );
+
+
+        return 0;
+    }
+
+
+    printk(
+        "APP: sampling interval=%u ms\n",
+
+        config_manager_get_sampling_interval_ms()
+    );
+
+
+    /* =====================================================
+     * 4. BLE Service Init
+     * =====================================================
+     */
+
+
+    ret =
+        ble_service_init();
+
+
+    if (ret != 0) {
+
+        printk(
+            "APP: BLE init failed: %d\n",
+            ret
+        );
+
+
+        return 0;
+    }
+
+
+    printk(
+        "APP: initialization completed\n"
+    );
+
+
+    /* =====================================================
+     * 5. Create Display Thread
+     * =====================================================
+     */
+
+
+    k_thread_create(
+        &display_thread_data,
+
+        display_thread_stack,
+
+        K_THREAD_STACK_SIZEOF(
+            display_thread_stack
+        ),
+
+        display_thread_entry,
+
+        NULL,
+        NULL,
+        NULL,
+
+        DISPLAY_THREAD_PRIORITY,
+
+        0,
+
+        K_NO_WAIT
+    );
+
+
+    printk(
+        "APP: display thread created\n"
+    );
+
+
+    /* =====================================================
+     * 6. Create Sensor Thread
+     * =====================================================
+     */
+
+
+    k_thread_create(
+        &sensor_thread_data,
+
+        sensor_thread_stack,
+
+        K_THREAD_STACK_SIZEOF(
+            sensor_thread_stack
+        ),
+
+        sensor_thread_entry,
+
+        NULL,
+        NULL,
+        NULL,
+
+        SENSOR_THREAD_PRIORITY,
+
+        0,
+
+        K_NO_WAIT
+    );
+
+
+    printk(
+        "APP: sensor thread created\n"
+    );
+
+
+    printk(
+        "APP: threads started\n"
+    );
+
+
+    /* =====================================================
+     * Main / Application Thread
+     * =====================================================
+     *
+     * Main Thread 现在负责：
+     *
+     * Sensor Message
+     *       ↓
+     * 数据判断
+     *       ↓
+     * BLE
+     *       ↓
+     * Display Message
+     *
+     * 它不直接读取 Sensor，
+     * 也不直接操作 OLED。
+     */
+
 
     while (1) {
 
-        /*
-         * ===============================================
-         * 1. DS18B20 获取新的温度样本
-         * ===============================================
+        /* =================================================
+         * 1. 等待 Sensor Message
+         * =================================================
+         *
+         * Queue 没消息时，
+         * Main Thread BLOCKED。
          */
 
-        ret = sensor_sample_fetch(
-            sensor
-        );
+
+        ret =
+            k_msgq_get(
+                &sensor_msgq,
+                &sensor_msg,
+                K_FOREVER
+            );
 
 
         if (ret != 0) {
 
             printk(
-                "sensor_sample_fetch failed: %d\n",
+                "APP: "
+                "sensor queue receive failed: %d\n",
+
                 ret
             );
 
 
-            /*
-             * 如果读取失败
-             * 等一下再重新尝试
-             */
-            k_sleep(
-                K_MSEC(sampling_interval_ms)
-            );
-
             continue;
         }
-
-
-        /*
-         * 获取实际温度
-         */
-        ret = sensor_channel_get(
-            sensor,
-
-            SENSOR_CHAN_AMBIENT_TEMP,
-
-            &temp
-        );
-
-
-        if (ret != 0) {
-
-            printk(
-                "sensor_channel_get failed: %d\n",
-                ret
-            );
-
-
-            k_sleep(
-                K_MSEC(sampling_interval_ms)
-            );
-
-            continue;
-        }
-
-
-        /*
-         * ===============================================
-         * 2. 转换温度
-         * ===============================================
-         *
-         * sensor_value:
-         *
-         * val1 = 整数部分
-         * val2 = 1 / 1000000
-         */
-
-
-        int64_t temp_micro =
-            ((int64_t)temp.val1 * 1000000LL)
-            +
-            temp.val2;
-
-
-        /*
-         * 转成 0.1°C
-         *
-         * 例如：
-         *
-         * 29.0°C
-         *
-         * →
-         *
-         * 290
-         */
-        current_temp_tenths =
-            (int16_t)(
-                temp_micro /
-                100000LL
-            );
-
-
-        /*
-         * ===============================================
-         * 3. 转成 OLED 字符串
-         * ===============================================
-         */
-
-        snprintf(
-            temp_text,
-
-            sizeof(temp_text),
-
-            "TEMP: %d.%d C",
-
-            current_temp_tenths / 10,
-
-            abs(
-                current_temp_tenths % 10
-            )
-        );
-
-
-        /*
-         * 串口输出
-         */
-        printk(
-            "%s\n",
-            temp_text
-        );
 
 
         /* =================================================
-         * 4. BLE Notification
+         * 2. Sensor 正常
          * =================================================
          */
 
-        if (ble_connected &&
-            notify_enabled) {
 
-            /*
-             * CPU格式
-             * →
-             * BLE Little Endian
-             */
-            int16_t notify_value =
-                sys_cpu_to_le16(
-                    current_temp_tenths
-                );
+        if (sensor_msg.sensor_ok) {
 
-
-            /*
-             * wearable_service.attrs[2]
-             *
-             * 就是 Temperature Value Attribute
-             */
-            ret = bt_gatt_notify(
-                NULL,
-
-                &wearable_service.attrs[2],
-
-                &notify_value,
-
-                sizeof(notify_value)
+            printk(
+                "APP: valid temperature=%d\n",
+                sensor_msg.temperature
             );
 
 
-            if (ret == 0) {
+            /* =============================================
+             * 更新 GATT Temperature Value
+             * =============================================
+             */
+
+
+            ble_service_set_temperature(
+                sensor_msg.temperature
+            );
+
+
+            /* =============================================
+             * Temperature Notification
+             * =============================================
+             *
+             * 没连接：
+             * 什么都不做。
+             *
+             * 没订阅：
+             * 什么都不做。
+             *
+             * 已连接 + 已订阅：
+             * Notification。
+             */
+
+
+            ret =
+                ble_service_notify_temperature();
+
+
+            if (ret != 0) {
 
                 printk(
-                    "NOTIFY temperature: %d.%d C\n",
+                    "APP: "
+                    "BLE notify failed: %d\n",
 
-                    current_temp_tenths / 10,
+                    ret
+                );
+            }
 
-                    abs(
-                        current_temp_tenths % 10
-                    )
+        } else {
+
+            /* =============================================
+             * 3. Sensor Fault
+             * =============================================
+             *
+             * 不把无效 Sensor 数据发送给 BLE。
+             *
+             * GATT 中仍保留上一次合法温度。
+             */
+
+
+            printk(
+                "APP: sensor fault error=%d, "
+                "BLE temperature update skipped\n",
+
+                sensor_msg.error_code
+            );
+        }
+
+
+        /* =================================================
+         * 4. Build Display Message
+         * =================================================
+         */
+
+
+        display_msg.temperature =
+            sensor_msg.temperature;
+
+
+        display_msg.ble_connected =
+            ble_service_is_connected();
+
+
+        display_msg.sensor_ok =
+            sensor_msg.sensor_ok;
+
+
+        display_msg.sensor_error =
+            sensor_msg.error_code;
+
+
+        /* =================================================
+         * 5. Send Display Message
+         * =================================================
+         */
+
+
+        ret =
+            k_msgq_put(
+                &display_msgq,
+                &display_msg,
+                K_NO_WAIT
+            );
+
+
+        /* =================================================
+         * Display Queue Full
+         * =================================================
+         *
+         * OLED 属于“状态型数据”。
+         *
+         * 我们只关心最新状态。
+         *
+         * 如果旧画面堆积：
+         *
+         * 删除旧数据
+         * ↓
+         * 保留最新状态
+         */
+
+
+        if (ret != 0) {
+
+            printk(
+                "APP: display queue full, "
+                "dropping stale frames\n"
+            );
+
+
+            k_msgq_purge(
+                &display_msgq
+            );
+
+
+            ret =
+                k_msgq_put(
+                    &display_msgq,
+                    &display_msg,
+                    K_NO_WAIT
                 );
 
-            } else {
+
+            if (ret != 0) {
 
                 printk(
-                    "Notification failed: %d\n",
+                    "APP: "
+                    "display queue put failed: %d\n",
+
                     ret
                 );
             }
         }
-
-
-        /* =================================================
-         * 5. OLED 刷新
-         * =================================================
-         */
-
-        cfb_framebuffer_clear(
-            display,
-            false
-        );
-
-
-        /*
-         * 第一行
-         */
-        cfb_print(
-            display,
-
-            "WEARABLE TEMP",
-
-            0,
-            0
-        );
-
-
-        /*
-         * 第二行
-         */
-        cfb_print(
-            display,
-
-            temp_text,
-
-            0,
-            20
-        );
-
-
-        /*
-         * 第三行 BLE 状态
-         */
-        if (ble_connected) {
-
-            cfb_print(
-                display,
-
-                "BLE: CONNECTED",
-
-                0,
-                40
-            );
-
-        } else {
-
-            cfb_print(
-                display,
-
-                "BLE: ADV",
-
-                0,
-                40
-            );
-        }
-
-
-        /*
-         * 真正刷新 OLED
-         */
-        ret = cfb_framebuffer_finalize(
-            display
-        );
-
-
-        if (ret != 0) {
-
-            printk(
-                "OLED refresh failed: %d\n",
-                ret
-            );
-        }
-
-
-        /* =================================================
-         * 6. 等待下一次采样
-         * =================================================
-         *
-         * 这个值现在可以通过 BLE WRITE 动态修改
-         */
-
-        k_sleep(
-            K_MSEC(
-                sampling_interval_ms
-            )
-        );
     }
 
 

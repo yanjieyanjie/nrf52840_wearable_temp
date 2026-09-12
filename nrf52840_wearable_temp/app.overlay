@@ -5,12 +5,16 @@
         zephyr,display = &oled;
     };
 
+    /*
+     * DS18B20
+     *
+     * DATA -> P0.06
+     */
     w1_0: w1 {
         compatible = "zephyr,w1-gpio";
 
         gpios = <&gpio0 6
                  (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
-
 
         status = "okay";
 
@@ -25,11 +29,24 @@
     };
 };
 
+
+/*
+ * SSD1306 OLED
+ *
+ * Board 默认：
+ *
+ * SDA -> P1.00
+ * SCL -> P0.11
+ *
+ * 地址：
+ * 0x3C
+ */
 &i2c0 {
     status = "okay";
 
     oled: ssd1306@3c {
         compatible = "solomon,ssd1306";
+
         reg = <0x3c>;
 
         width = <128>;
